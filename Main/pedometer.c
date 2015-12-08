@@ -49,15 +49,17 @@ typedef struct
 } SENSOR_DATA_TypeDef;
 
 //Step count definitions
-SENSOR_DATA_TypeDef THRESH = {35,225,225};
-SENSOR_DATA_TypeDef MAX_DATA = {0,0,0};                //max-min to select most active axis
-SENSOR_DATA_TypeDef MIN_DATA = {1000,1000,1000};
-SENSOR_DATA_TypeDef LAST_SAMPLE = {0,0,0};
-SENSOR_DATA_TypeDef CURR_SAMPLE = {0,0,0};	
+SENSOR_DATA_TypeDef THRESH			= {35,225,225};
+SENSOR_DATA_TypeDef MAX_DATA 		= {0,0,0};              
+SENSOR_DATA_TypeDef MIN_DATA 		= {1000,1000,1000};
+SENSOR_DATA_TypeDef DELTA 			= {1000,1000,1000};                    //max-min to select most active axis
+SENSOR_DATA_TypeDef RES             = {1000,1000,1000};
+SENSOR_DATA_TypeDef LAST_SAMPLE 	= {0,0,0};
+SENSOR_DATA_TypeDef CURR_SAMPLE 	= {0,0,0};	
 SENSOR_DATA_TypeDef AVERAGE_DATA[4] = {{0,0,0},{0,0,0},{0,0,0},{0,0,0}};
 int STEP_COUNT=0;
 
-
+#define max(a,b) ((a) > (b) ? (a) : (b))
 
 volatile uint32_t msTicks; /* counts 1ms timeTicks */
 
@@ -265,13 +267,15 @@ void ADXL345_READ_FIFO(SENSOR_DATA_TypeDef *axis_converted_avg)
    uint16_t axis_data[33][3];
    uint8_t init_flag=0;
    SENSOR_DATA_TypeDef axis_converted[33];
+   uint8_t res_div = 10;
+   
+   //reinit MAX and MIN value for each FIFO read
    MAX_DATA.X = 0;
    MAX_DATA.Y = 0;
    MAX_DATA.Z = 0;
    MIN_DATA.X = 1000;
    MIN_DATA.Y = 1000;
    MIN_DATA.Z = 1000;
-   
    //check if this is the very first data collection
    if(ADXL345_IS_NULL(AVERAGE_DATA[0]) && ADXL345_IS_NULL(AVERAGE_DATA[1]) && ADXL345_IS_NULL(AVERAGE_DATA[2]))
    {
@@ -281,6 +285,7 @@ void ADXL345_READ_FIFO(SENSOR_DATA_TypeDef *axis_converted_avg)
 	{
 		ADXL345_Read_Reg(ADXL345Handle.port, DATA_START_REG_ADDR,(uint8_t*)axis_data[i],6);
 		axis_converted[i] = ADXL345_DATA_CONVERT(axis_data[i]);	
+		//Take care of first data collection issue
 		if(i==0 && init_flag)
 		{
 			AVERAGE_DATA[0] = axis_converted[i];
@@ -302,15 +307,14 @@ void ADXL345_READ_FIFO(SENSOR_DATA_TypeDef *axis_converted_avg)
 		if(MIN_DATA.Y>axis_converted_avg[i].Y)  MIN_DATA.Y=axis_converted_avg[i].Y;
 		if(MIN_DATA.Z>axis_converted_avg[i].Z)  MIN_DATA.Z=axis_converted_avg[i].Z;		
 	}	
-	// //if it is the first data collection, then do not average over data points
-	// if(init_flag)
-	// {
-		// axis_converted_avg[2] = axis_converted[2];
-		// axis_converted_avg[1] = axis_converted[1];
-		// axis_converted_avg[0] = axis_converted[0];
-	// }
 	
+	//Calculate resolution for step counting 
 	THRESH = ADXL345_AVERAGE(axis_converted_avg,33);
+	DELTA =  ADXL345_MINUS(MAX_DATA,MIN_DATA);
+	RES.X = max(MAX_DATA.X-THRESH.X, THRESH.X-MIN_DATA.X)/res_div;
+	RES.Y = max(MAX_DATA.Y-THRESH.Y, THRESH.Y-MIN_DATA.Y)/res_div;
+	RES.Z = max(MAX_DATA.Z-THRESH.Z, THRESH.Z-MIN_DATA.Z)/res_div;
+	
 }
 
 /**************************************************************************//**
@@ -319,20 +323,49 @@ void ADXL345_READ_FIFO(SENSOR_DATA_TypeDef *axis_converted_avg)
  *****************************************************************************/
 void ADXL345_STEPCOUNT(SENSOR_DATA_TypeDef NEW_SAMPLE)
 {
-	SENSOR_DATA_TypeDef DELTA;
-	//by comparing max-min value for 50 samples
-	DELTA = ADXL345_MINUS(LAST_SAMPLE,CURR_SAMPLE);
-	if((LAST_SAMPLE.X-THRESH.X>30) && (CURR_SAMPLE.X-THRESH.X<-30))
+	//@TODO add time window and step model rule 
+	if(abs(DELTA.X)>=abs(DELTA.Y) && abs(DELTA.X)>=abs(DELTA.Z) )
 	{
-		STEP_COUNT++;
-		LAST_SAMPLE = CURR_SAMPLE;
-		CURR_SAMPLE = NEW_SAMPLE;
-	}	
-	else
-	{
-		LAST_SAMPLE = CURR_SAMPLE;
-		CURR_SAMPLE = NEW_SAMPLE;
+		if((LAST_SAMPLE.X-THRESH.X>RES.X) && (CURR_SAMPLE.X-THRESH.X<-RES.X))
+		{
+			STEP_COUNT++;
+			LAST_SAMPLE = CURR_SAMPLE;
+		}	
+		else
+		{
+			LAST_SAMPLE = CURR_SAMPLE;
+			CURR_SAMPLE = NEW_SAMPLE;
+		}
 	}
+	
+	else if(abs(DELTA.Y)>=abs(DELTA.X) && abs(DELTA.Y)>=abs(DELTA.Z) )
+	{
+		if((LAST_SAMPLE.Y-THRESH.Y>RES.Y) && (CURR_SAMPLE.Y-THRESH.Y<-RES.Y))
+		{
+			STEP_COUNT++;
+			LAST_SAMPLE = CURR_SAMPLE;
+		}	
+		else
+		{
+			LAST_SAMPLE = CURR_SAMPLE;
+			CURR_SAMPLE = NEW_SAMPLE;
+		}
+	}
+	
+	else if(abs(DELTA.Z)>=abs(DELTA.X) && abs(DELTA.Z)>=abs(DELTA.X) )
+	{
+		if((LAST_SAMPLE.Z-THRESH.Z>RES.Z) && (CURR_SAMPLE.Z-THRESH.Z<-RES.Z))
+		{
+			STEP_COUNT++;
+			LAST_SAMPLE = CURR_SAMPLE;
+		}	
+		else
+		{
+			LAST_SAMPLE = CURR_SAMPLE;
+			CURR_SAMPLE = NEW_SAMPLE;
+		}
+	}
+	
 }
 
 // /**************************************************************************//**
@@ -475,8 +508,6 @@ int main(void)
 {
   int i;
   uint8_t data[7];
-  uint16_t axis_data[33][3];
-  SENSOR_DATA_TypeDef axis_converted[33];
   SENSOR_DATA_TypeDef axis_converted_avg[33];
   char lcd_data[20];
   /* ADXL345 I2C driver config */
