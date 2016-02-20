@@ -17,6 +17,7 @@
 #include "em_cmu.h"
 #include "em_emu.h"
 #include "em_gpio.h"
+#include "em_usart.h"
 #include "i2cspm.h"
 #include "bsp.h"
 #include "segmentlcd.h"
@@ -63,7 +64,22 @@ int STEP_COUNT=0;
 
 volatile uint32_t msTicks; /* counts 1ms timeTicks */
 
+/* Declare a circular buffer structure to use for Rx and Tx queues */
+#define BUFFERSIZE          256
 
+volatile struct circularBuffer
+{
+  uint8_t  data[BUFFERSIZE];  /* data buffer */
+  uint32_t rdI;               /* read index */
+  uint32_t wrI;               /* write index */
+  uint32_t pendingBytes;      /* count of how many bytes are not yet handled */
+  bool     overflow;          /* buffer overflow indicator */
+} rxBuf, txBuf = { {0}, 0, 0, 0, false };
+
+
+/* Setup USART1 in async mode for RS232*/
+static USART_TypeDef           * uart   = USART1;
+static USART_InitAsync_TypeDef uartInit = USART_INITASYNC_DEFAULT;
 
 
 static int32_t 				ADXL345_Read_Reg(I2C_TypeDef *i2c, uint8_t reg_addr, uint8_t *data, uint32_t len);
@@ -78,6 +94,9 @@ SENSOR_DATA_TypeDef 		ADXL345_DEVIDE(SENSOR_DATA_TypeDef data0, SENSOR_DATA_Type
 SENSOR_DATA_TypeDef 		ADXL345_AVERAGE(SENSOR_DATA_TypeDef *data, uint32_t len);
 bool 						ADXL345_IS_NULL(SENSOR_DATA_TypeDef data);
 void 						ADXL345_STEPCOUNT(SENSOR_DATA_TypeDef NEW_SAMPLE);
+
+
+
 /**************************************************************************//**
  * @brief
  *  Reads data from the ADXL345 sensor.
@@ -319,6 +338,21 @@ void ADXL345_READ_FIFO(SENSOR_DATA_TypeDef *axis_converted_avg)
 
 /**************************************************************************//**
  * @brief
+ * Read full FIFO of ADXL345 sensor, average over 4 consecutive data points
+ *****************************************************************************/
+void ADXL345_READ_FIFO_RAW(uint16_t **axis_data)
+{
+  
+   for(uint8_t i=0;i<33;i++)
+	{
+		ADXL345_Read_Reg(ADXL345Handle.port, DATA_START_REG_ADDR,(uint8_t*)axis_data[i],6);
+	}
+	
+}
+
+
+/**************************************************************************//**
+ * @brief
  * Calibrate ADXL345 sensor
  *****************************************************************************/
 void ADXL345_STEPCOUNT(SENSOR_DATA_TypeDef NEW_SAMPLE)
@@ -473,6 +507,162 @@ bool ADXL345_IS_NULL(SENSOR_DATA_TypeDef data)
 }
 
 
+/**************************************************************************//**
+ * @brief  Setup UART
+ *****************************************************************************/
+void setupUart(void)
+{
+/* Enable clock for GPIO module (required for pin configuration) */
+  CMU_ClockEnable(cmuClock_GPIO, true);
+  /* Configure GPIO pins */
+  GPIO_PinModeSet(gpioPortD, 0, gpioModePushPull, 1);
+  GPIO_PinModeSet(gpioPortD, 1, gpioModeInput, 0);
+
+  /* Prepare struct for initializing UART in asynchronous mode*/
+  uartInit.enable       = usartDisable;   /* Don't enable UART upon intialization */
+  uartInit.refFreq      = 0;              /* Provide information on reference frequency. When set to 0, the reference frequency is */
+  uartInit.baudrate     = 115200;         /* Baud rate */
+  uartInit.databits     = usartDatabits8; /* Number of data bits. Range is 4 to 10 */
+  uartInit.parity       = usartNoParity;  /* Parity mode */
+  uartInit.stopbits     = usartStopbits1; /* Number of stop bits. Range is 0 to 2 */
+  uartInit.mvdis        = false;          /* Disable majority voting */
+  uartInit.mvdis        = false;          /* Disable majority voting */
+  uartInit.prsRxEnable  = false;          /* Enable USART Rx via Peripheral Reflex System */
+  uartInit.prsRxCh      = usartPrsRxCh0;  /* Select PRS channel if enabled */
+  
+  /* Initialize USART with uartInit struct */
+  USART_InitAsync(uart, &uartInit);
+
+  /* Prepare UART Rx and Tx interrupts */
+  USART_IntClear(uart, _UART_IFC_MASK);
+  USART_IntEnable(uart, UART_IEN_RXDATAV);
+  NVIC_ClearPendingIRQ(USART1_RX_IRQn);
+  NVIC_ClearPendingIRQ(USART1_TX_IRQn);
+  NVIC_EnableIRQ(USART1_RX_IRQn);
+  NVIC_EnableIRQ(USART1_TX_IRQn);
+
+  /* Enable I/O pins at USART1 location #2 */
+  uart->ROUTE = UART_ROUTE_RXPEN | UART_ROUTE_TXPEN | UART_ROUTE_LOCATION_LOC1;
+
+  /* Enable UART */
+  USART_Enable(uart, usartEnable);
+}
+
+/**************************************************************************//**
+ * @brief USART1 RX IRQ Handler
+ *
+ * Set up the interrupt prior to use
+ *
+ * Note that this function handles overflows in a very simple way.
+ *
+ *****************************************************************************/
+void USART1_RX_IRQHandler(void)
+{
+  /* Check for RX data valid interrupt */
+  if (uart->IF & UART_IF_RXDATAV)
+  {
+    /* Copy data into RX Buffer */
+    uint8_t rxData = USART_Rx(uart);
+    rxBuf.data[rxBuf.wrI] = rxData;
+    rxBuf.wrI             = (rxBuf.wrI + 1) % BUFFERSIZE;
+    rxBuf.pendingBytes++;
+
+    /* Flag Rx overflow */
+    if (rxBuf.pendingBytes > BUFFERSIZE)
+    {
+      rxBuf.overflow = true;
+    }
+  }
+}
+
+/**************************************************************************//**
+ * @brief USART1 TX IRQ Handler
+ *
+ * Set up the interrupt prior to use
+ *
+ *****************************************************************************/
+void USART1_TX_IRQHandler(void)
+{
+  /* Check TX buffer level status */
+  if (uart->IF & UART_IF_TXBL)
+  {
+    if (txBuf.pendingBytes > 0)
+    {
+      /* Transmit pending character */
+      USART_Tx(uart, txBuf.data[txBuf.rdI]);
+      txBuf.rdI = (txBuf.rdI + 1) % BUFFERSIZE;
+      txBuf.pendingBytes--;
+    }
+
+    /* Disable Tx interrupt if no more bytes in queue */
+    if (txBuf.pendingBytes == 0)
+    {
+      USART_IntDisable(uart, UART_IEN_TXBL);
+    }
+  }
+}
+
+/******************************************************************************
+ * @brief  uartPutData function
+ *
+ *****************************************************************************/
+void uartPutData(uint8_t * dataPtr, uint32_t dataLen)
+{
+  uint32_t i = 0;
+
+  /* Check if buffer is large enough for data */
+  if (dataLen > BUFFERSIZE)
+  {
+    /* Buffer can never fit the requested amount of data */
+    return;
+  }
+
+  /* Check if buffer has room for new data */
+  if ((txBuf.pendingBytes + dataLen) > BUFFERSIZE)
+  {
+    /* Wait until room */
+    while ((txBuf.pendingBytes + dataLen) > BUFFERSIZE) ;
+  }
+
+  /* Fill dataPtr[0:dataLen-1] into txBuffer */
+  while (i < dataLen)
+  {
+    txBuf.data[txBuf.wrI] = *(dataPtr + i);
+    txBuf.wrI             = (txBuf.wrI + 1) % BUFFERSIZE;
+    i++;
+  }
+
+  /* Increment pending byte counter */
+  txBuf.pendingBytes += dataLen;
+
+  /* Enable interrupt on USART TX Buffer*/
+  USART_IntEnable(uart, UART_IEN_TXBL);
+}
+
+// ***************************************************************************//**
+ // * @brief Set up Clock Management Unit
+ // ******************************************************************************/
+void cmuSetup(void)
+{
+  /* Start HFXO and wait until it is stable */
+  /* CMU_OscillatorEnable( cmuOsc_HFXO, true, true); */
+
+  /* Select HFXO as clock source for HFCLK */
+  /* CMU_ClockSelectSet(cmuClock_HF, cmuSelect_HFXO ); */
+
+  /* Disable HFRCO */
+  /* CMU_OscillatorEnable( cmuOsc_HFRCO, false, false ); */
+
+  /* Enable clock for HF peripherals */
+  CMU_ClockEnable(cmuClock_HFPER, true);
+
+  /* Enable clock for USART module */
+  CMU_ClockEnable(cmuClock_USART1, true);
+}
+
+
+
+
 /* Local prototypes */
 void Delay(uint32_t dlyTicks);
 
@@ -519,14 +709,17 @@ int main(void)
   ADXL345Handle.portLocation = ADXL345_I2C_PORT_LOC;
   /* Chip errata */
   CHIP_Init();
-
+  cmuSetup();
   /* If first word of user data page is non-zero, enable eA Profiler trace */
-  BSP_TraceProfilerSetup();
+  // BSP_TraceProfilerSetup();
 
-  /* Enable two leds to show we're alive */
-  BSP_LedsInit();
-  BSP_LedSet(0);
-  BSP_LedSet(1);
+  // /* Enable two leds to show we're alive */
+  // BSP_LedsInit();
+  // BSP_LedSet(0);
+  // BSP_LedSet(1);
+  
+  /* Configure UART operation */
+  setupUart();
 
   /* Setup SysTick Timer for 1 msec interrupts  */
   if (SysTick_Config(CMU_ClockFreqGet(cmuClock_CORE) / 1000)) while (1) ;
@@ -549,6 +742,9 @@ int main(void)
 	SegmentLCD_Write("AXISDATA");
 	Delay(500);
 	/* Infinite loop with test pattern. */
+	uint8_t welcome[20] = "hello welcome";
+	uartPutData(welcome,15);
+	uint16_t axis_data[33][3];
    while(1)
    {
 	   // axis_converted_avg.X =  0;
@@ -556,48 +752,19 @@ int main(void)
 	   // axis_converted_avg.Z =  0;
 	   ADXL345_Read_Reg(ADXL345Handle.port, 0x30,data,1);
 	   if(data[0]&0x02)
-	   {
-		   
-		 ADXL345_READ_FIFO(axis_converted_avg);
-		    // sprintf(lcd_data,"X:%d",(int)axis_converted_avg.X/i);
-		    // SegmentLCD_Write(lcd_data);
-			// Delay(500);
-			// sprintf(lcd_data,"Y:%d",(int)axis_converted_avg.Y/i);
-		    // SegmentLCD_Write(lcd_data);
-			// Delay(500);
-			// sprintf(lcd_data,"Z:%d",(int)axis_converted_avg.Z/i);
-		    // SegmentLCD_Write(lcd_data);
-			// Delay(500);  
-		 for(i=0;i<33;i++)
-		 {
-			ADXL345_STEPCOUNT(axis_converted_avg[i]); 
-		 }
-		 
-
+	   {   
+		for(uint8_t i=0;i<33;i++)
+			{
+				ADXL345_Read_Reg(ADXL345Handle.port, DATA_START_REG_ADDR,(uint8_t*)axis_data[i],6);
+				uartPutData((uint8_t*)axis_data[i],6);
+				uartPutData("\n",sizeof("\n"));
+			}
 	   }
-	  SegmentLCD_LowerNumber(STEP_COUNT);
-	// SegmentLCD_LowerNumber(ADXL345_DATA_CONVERT(axis_data[0]));
-	 Delay(500);        
+	  // SegmentLCD_LowerNumber(STEP_COUNT);
+	// // SegmentLCD_LowerNumber(ADXL345_DATA_CONVERT(axis_data[0]));
+	 // Delay(500);        
 	// SegmentLCD_LowerNumber(ADXL345_DATA_CONVERT(axis_data[1]));
 	// Delay(500);          
-	// SegmentLCD_LowerNumber(ADXL345_DATA_CONVERT(axis_data[2]));
-	// Delay(500);      	
-	// ADXL345_Read_Reg(ADXL345Handle.port, 0x1e,data,1);
-	// SegmentLCD_LowerHex(data[0]);
-	// Delay(500);   
-	// ADXL345_Read_Reg(ADXL345Handle.port, 0x1f,data,1);
-	// SegmentLCD_LowerHex(data[0]);
-	// Delay(500);  
-	// ADXL345_Read_Reg(ADXL345Handle.port, 0x20,data,1);
-	// SegmentLCD_LowerHex(data[0]);
-	// Delay(500);  
-
-	// SegmentLCD_LowerHex(axis_data[1]<< 8 + axis_data[0]);
-	// Delay(500);
-	// SegmentLCD_LowerHex(axis_data[3]<< 8 + axis_data[2]);
-	// Delay(500);
-	// SegmentLCD_LowerHex(axis_data[5]<< 8 + axis_data[4]);
-	// Delay(1000);
   }
 
 
